@@ -20,10 +20,14 @@ from supervisor.state import (
     QUEUE_SNAPSHOT_PATH, budget_pct, TOTAL_BUDGET_LIMIT,
     budget_remaining, EVOLUTION_BUDGET_RESERVE,
 )
-from supervisor.telegram import send_with_budget
+from supervisor.telegram import TelegramBot
 
 log = logging.getLogger(__name__)
 
+
+# Initialize TelegramBot instance
+telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+telegram_bot = TelegramBot(telegram_token)
 
 # ---------------------------------------------------------------------------
 # Module-level config (set via init())
@@ -277,7 +281,7 @@ def enforce_task_timeouts() -> None:
         if runtime_sec >= SOFT_TIMEOUT_SEC and not bool(meta.get("soft_sent")):
             meta["soft_sent"] = True
             if owner_chat_id:
-                send_with_budget(
+                telegram_bot.send_with_budget(
                     owner_chat_id,
                     f"⏱️ Task {task_id} running for {int(runtime_sec)}s. "
                     f"type={task_type}, heartbeat_lag={int(hb_lag_sec)}s. Continuing.",
@@ -329,12 +333,12 @@ def enforce_task_timeouts() -> None:
 
         if owner_chat_id:
             if requeued:
-                send_with_budget(owner_chat_id, (
+                telegram_bot.send_with_budget(owner_chat_id, (
                     f"🛑 Hard-timeout: task {task_id} killed after {int(runtime_sec)}s.\n"
                     f"Worker {worker_id} restarted. Task queued for retry attempt={new_attempt}."
                 ))
             else:
-                send_with_budget(owner_chat_id, (
+                telegram_bot.send_with_budget(owner_chat_id, (
                     f"🛑 Hard-timeout: task {task_id} killed after {int(runtime_sec)}s.\n"
                     f"Worker {worker_id} restarted. Retry limit exhausted, task stopped."
                 ))
@@ -371,7 +375,7 @@ def queue_review_task(reason: str, force: bool = False) -> Optional[str]:
         "text": build_review_task_text(reason=reason),
     })
     persist_queue_snapshot(reason="review_enqueued")
-    send_with_budget(int(owner_chat_id), f"🔎 Review queued: {tid} ({reason})")
+    telegram_bot.send_with_budget(int(owner_chat_id), f"🔎 Review queued: {tid} ({reason})")
     return tid
 
 
@@ -395,27 +399,18 @@ def enqueue_evolution_task_if_needed() -> None:
     if consecutive_failures >= 3:
         st["evolution_mode_enabled"] = False
         save_state(st)
-        send_with_budget(
-            int(owner_chat_id),
-            f"🧬⚠️ Evolution paused: {consecutive_failures} consecutive failures. "
-            f"Use /evolve start to resume after investigating the issue."
-        )
-        return
-
-    remaining = budget_remaining(st)
-    if remaining < EVOLUTION_BUDGET_RESERVE:
-        st["evolution_mode_enabled"] = False
-        save_state(st)
-        send_with_budget(int(owner_chat_id), f"💸 Evolution stopped: ${remaining:.2f} remaining (reserve ${EVOLUTION_BUDGET_RESERVE:.0f} for conversations).")
-        return
+    telegram_bot.send_with_budget(owner_chat_id, "Evolution paused (3 consecutive failures).")
+    return
+    
+    # Enqueue evolution
     cycle = int(st.get("evolution_cycle") or 0) + 1
     tid = uuid.uuid4().hex[:8]
     enqueue_task({
-        "id": tid, "type": "evolution",
-        "chat_id": int(owner_chat_id),
-        "text": build_evolution_task_text(cycle),
+        "id": tid, "type": "evolution", "chat_id": int(owner_chat_id),
+        "text": build_evolution_task_text(cycle=cycle),
     })
     st["evolution_cycle"] = cycle
-    st["last_evolution_task_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    st["evolution_consecutive_failures"] = 0  # Reset on success
     save_state(st)
-    send_with_budget(int(owner_chat_id), f"🧬 Evolution #{cycle}: {tid}")
+    persist_queue_snapshot(reason="evolution_enqueued")
+    telegram_bot.send_with_budget(int(owner_chat_id), f"🧬 Evolution #{cycle} started: {tid}")
