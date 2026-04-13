@@ -181,7 +181,7 @@ def handle_chat_direct(chat_id: int, text: str, image_data: Optional[Union[Tuple
             },
         )
         try:
-            get_tg().send_with_budget(chat_id, err_msg)
+            telegram_bot.send_with_budget(chat_id, err_msg)
         except Exception:
             log.debug("Suppressed exception", exc_info=True)
 
