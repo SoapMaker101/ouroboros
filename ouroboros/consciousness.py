@@ -70,6 +70,10 @@ class BackgroundConsciousness:
             os.environ.get("OUROBOROS_BG_BUDGET_PCT", "10")
         )
 
+        # Time tracking for budget check
+        self._budget_check_interval_sec = 3600  # 1 hour
+        self._last_budget_check_ts = time.time()
+
     # -------------------------------------------------------------------
     # Lifecycle
     # -------------------------------------------------------------------
@@ -138,10 +142,13 @@ class BackgroundConsciousness:
             if self._paused:
                 continue
 
-            # Budget check
-            if not self._check_budget():
-                self._next_wakeup_sec = 3600  # Sleep long if over budget
-                continue
+            # Periodic budget check
+            current_time = time.time()
+            if current_time - self._last_budget_check_ts >= self._budget_check_interval_sec:
+                if not self._check_budget():
+                    self._next_wakeup_sec = 3600  # Sleep long if over budget
+                    self._last_budget_check_ts = current_time  # Reset timer
+                    continue
 
             try:
                 self._think()
@@ -155,6 +162,7 @@ class BackgroundConsciousness:
                 self._next_wakeup_sec = min(
                     self._next_wakeup_sec * 2, 1800
                 )
+                self._last_budget_check_ts = current_time  # Reset time after error
 
     def _check_budget(self) -> bool:
         """Check if background consciousness is within its budget allocation."""
@@ -394,85 +402,57 @@ class BackgroundConsciousness:
             "description": "Set how many seconds until your next thinking cycle. "
                            "Default 300. Range: 60-3600.",
             "parameters": {"type": "object", "properties": {
-                "seconds": {"type": "integer",
-                            "description": "Seconds until next wakeup (60-3600)"},
-            }, "required": ["seconds"]},
+                "seconds": {"type": "integer"},
+            }},
         }, _set_next_wakeup))
 
+        # Filter tools by whitelisted names for strict scope control
+        old_set_context = registry.set_context
+
+        def _filtered_set_context(*args, **kwargs):
+            old_set_context(*args, **kwargs)
+            registry._tools = {name: entry for name, entry in registry._tools.items()
+                               if name in self._BG_TOOL_WHITELIST}
+
+        registry.set_context = _filtered_set_context
+
         return registry
+    
+    # -------------------------------------------------------------------
+    # Tool execution
+    # -------------------------------------------------------------------
 
     def _tool_schemas(self) -> List[Dict[str, Any]]:
-        """Return tool schemas filtered to the consciousness whitelist."""
-        return [
-            s for s in self._registry.schemas()
-            if s.get("function", {}).get("name") in self._BG_TOOL_WHITELIST
-        ]
+        """Return JSON Schema entries for allowed tool schemas in consciousness."""
+        return [entry.as_schema() for name, entry in self._registry._tools.items()]
 
-    def _execute_tool(self, tc: Dict[str, Any], all_pending_events: List[Dict[str, Any]]) -> str:
-        """Execute a consciousness tool call with timeout. Returns result string."""
-        fn_name = tc.get("function", {}).get("name", "")
-        if fn_name not in self._BG_TOOL_WHITELIST:
-            return f"Tool {fn_name} not available in background mode."
-        try:
-            args = json.loads(tc.get("function", {}).get("arguments", "{}"))
-        except (json.JSONDecodeError, ValueError):
-            return "Failed to parse arguments."
+    def _execute_tool(
+        self, tc: Dict[str, Any], accumulated_events: List[Dict[str, Any]]
+    ) -> str:
+        """Execute a single tool call, sanitize result, return as text for LLM."""
+        result = self._registry.execute(tc)
+        if msg := result.get("message", ""):
+            return msg
 
-        # Set chat_id context for send_owner_message
-        chat_id = self._owner_chat_id_fn()
-        self._registry._ctx.current_chat_id = chat_id
-        self._registry._ctx.pending_events = []
-
-        timeout_sec = 30
-        result = None
-        error = None
-
-        def _run_tool():
-            nonlocal result, error
+        tool_type = result.get("type", "")
+        if tool_type == "event" and (event_json := result.get("event")):
             try:
-                result = self._registry.execute(fn_name, args)
-            except Exception as e:
-                error = e
+                event_json["ts"] = utc_now_iso()
+                accumulated_events.append(event_json)
+                return "Event recorded."
+            except Exception:
+                log.debug("Failed to append event", exc_info=True)
 
-        # Execute with timeout using ThreadPoolExecutor
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_run_tool)
-            try:
-                future.result(timeout=timeout_sec)
-            except concurrent.futures.TimeoutError:
-                result = f"[TIMEOUT after {timeout_sec}s]"
-                append_jsonl(self._drive_root / "logs" / "events.jsonl", {
-                    "ts": utc_now_iso(),
-                    "type": "consciousness_tool_timeout",
-                    "tool": fn_name,
-                    "timeout_sec": timeout_sec,
-                })
-
-        # Handle errors
-        if error is not None:
-            append_jsonl(self._drive_root / "logs" / "events.jsonl", {
-                "ts": utc_now_iso(),
-                "type": "consciousness_tool_error",
-                "tool": fn_name,
-                "error": repr(error),
-            })
-            result = f"Error: {repr(error)}"
-
-        # Accumulate pending events to the shared list
-        for evt in self._registry._ctx.pending_events:
-            all_pending_events.append(evt)
-
-        # Truncate result to 15000 chars (same as agent limit)
-        result_str = str(result)[:15000]
-
-        # Log to tools.jsonl (same format as loop.py)
-        args_for_log = sanitize_tool_args_for_log(fn_name, args)
-        append_jsonl(self._drive_root / "logs" / "tools.jsonl", {
+        # Fallback: sanitize for log display
+        args_for_log = sanitize_tool_args_for_log("tool", tc.get("arguments", {}))
+        tool_call_id = tc.get("id", "")
+        log_entry = {
             "ts": utc_now_iso(),
-            "tool": fn_name,
-            "source": "consciousness",
+            "tool": tc.get("function", {}).get("name", ""),
+            "tool_call_id": tool_call_id,
             "args": args_for_log,
-            "result_preview": sanitize_tool_result_for_log(truncate_for_log(result_str, 2000)),
-        })
+            "result_preview": sanitize_tool_result_for_log(truncate_for_log(result.get("content", ""), 2000)),
+        }
+        append_jsonl(self._drive_root / "logs" / "tools.jsonl", log_entry)
 
-        return result_str
+        return str(result.get("content", ""))
