@@ -1,3 +1,5 @@
+from typing import List, Dict, Any
+
 ...
 
 def get_updates(self, offset: int, timeout: int = 10) -> List[Dict[str, Any]]:
